@@ -1,0 +1,763 @@
+---
+title: "Capital One Data Science Challenge"
+date: "2/8/2021"
+output:
+  word_document: default
+  html_document: default
+  pdf_document:
+    toc: true
+editor_options:
+  chunk_output_type: console
+---
+\pagebreak
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE,message=FALSE)
+```
+
+# Dataset Preparation
+
+Downloading and Unzipping the dataset.
+```{r eval=FALSE}
+url <- "https://github.com/CapitalOneRecruiting/DS/raw/master/transactions.zip"
+curl::curl_download(url,destfile = "data.zip")
+unzip("data.zip")
+```
+
+Loading into memory as a dataframe
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+library(tidylog)
+library(vroom)
+```
+
+```{r eval=FALSE}
+raw_data <- vroom_lines("transactions.txt")
+df <- map_dfr(raw_data,parse_json)
+```
+
+```{r include=FALSE}
+#saveRDS(df,file = "df.rds")
+df <- read_rds(file = "df.rds")
+```
+
+## Summary Statistics for all atributes
+```{r cache=TRUE, comment=NA}
+library(summarytools)
+
+dfSummary(df, plain.ascii = FALSE, style = "grid", graph.col = FALSE,
+          valid.col = FALSE, tmp.img.dir = "/tmp")
+
+```
+
+# Data Cleaning
+
+Converting all empty string to NA in column of type string
+```{r}
+df <- 
+  df %>% 
+  mutate(across(where(is_character), na_if,""))
+```
+
+
+Dropping echoBuffer, merchantCity, merchantState, merchantZip, posOnPremises and recurringAuthInd since these have all observations missing.
+```{r}
+df <- 
+df %>% 
+  select(-echoBuffer, -merchantCity, -merchantState, -merchantZip, -posOnPremises, -recurringAuthInd)
+```
+
+Changing date column to date data type.
+```{r}
+library(janitor)
+library(lubridate)
+
+df <- 
+  df %>% 
+  mutate(transactionDateTime = ymd_hms(transactionDateTime),
+         currentExpDate = my(currentExpDate),
+         accountOpenDate = ymd(accountOpenDate),
+         dateOfLastAddressChange = ymd(dateOfLastAddressChange))
+```
+
+Visualizing distribution of Transaction Amount
+
+```{r}
+df %>% 
+  ggplot(aes(transactionAmount)) +
+  geom_histogram(binwidth = 50)+
+  labs(
+    title = "Histogram of Transaction Amount",
+    x = "Amount($)",
+    y = "Freq"
+  )+
+  theme_minimal()
+```
+
+Here most of the transaction lies below $100 and the distribution is positively skewed.
+```{r}
+library(glue)
+df %>% 
+  ggplot(aes(transactionAmount)) +
+  geom_histogram(binwidth = 50)+
+  labs(
+    title = "Histogram of Transaction Amount",
+    x = "Amount($)",
+    y = "Freq"
+  )+
+  geom_vline(xintercept = median(df$transactionAmount), color="red")+
+  annotate("text",x=300,y=150000,label=glue("median = {median(df$transactionAmount)}"))+
+  theme_minimal()
+```
+
+This distribution looks like a log normal distribution.
+
+```{r}
+library(scales)
+df %>% 
+  ggplot(aes(transactionAmount)) +
+  geom_histogram()+
+  labs(
+    title = "Histogram of Transaction Amount",
+    x = "Amount($) in log10 scale",
+    y = "Freq"
+  )+
+  scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x))) +
+  theme_minimal()
+```
+
+
+# Data Wrangling
+
+## Reversed Transaction
+Looking into Purchased and Reversed pairs of transaction(ordered by datetime) per customer.  
+Here I am grouping the dataset by customer id and checking if transaction type matches with its lagged version.
+```{r cache=TRUE}
+df_rev <- 
+df %>% 
+  filter(transactionType %in% c("PURCHASE","REVERSAL")) %>% 
+  group_by(customerId) %>% 
+  arrange(transactionDateTime) %>% 
+  group_map(~ (mutate(.x,transactionTypeLagged = lead(transactionType,default = "PURCHASE")) %>%
+              filter(transactionType != transactionTypeLagged))) %>% 
+  bind_rows() %>% 
+  ungroup()
+
+df_rev %>% 
+  select(accountNumber,transactionDateTime,transactionAmount, transactionType) %>% 
+  head(10) %>% 
+  knitr::kable()
+```
+Not all Purchased and Reversed pairs are actually Reversed Transaction. So,  
+For a transaction to be reversed, a normal purchase should be followed by a reversed and both should have same transaction amount.
+
+```{r}
+df_rev_eq <- 
+df_rev %>% 
+  mutate(index = ceiling((1: n())/2)) %>% 
+  group_by(index) %>% 
+  mutate(avg_amount = sum(transactionAmount)/2) %>% 
+  ungroup() %>% 
+  filter(transactionAmount == avg_amount) %>% 
+  select(-index, -avg_amount, -transactionTypeLagged)
+
+df_rev_eq %>% 
+  select(accountNumber,transactionDateTime,transactionAmount, transactionType) %>% 
+  head(10) %>% 
+  knitr::kable()
+```
+
+So total reversal amount and count is:
+```{r}
+df_rev_eq %>% 
+  filter(transactionType == "REVERSAL") %>%
+  summarise(TotalReversalAmount = sum(transactionAmount),
+            TotalReversalCount = n()) %>% 
+  knitr::kable()
+```
+
+Removing all Purchased and Reversed pairs
+
+```{r}
+df <- 
+df %>% 
+  anti_join(df_rev_eq)
+  
+```
+
+
+## Multi-swipe Transaction
+A transaction is multi-swiped if same transaction occur multiple times but in short duration. I am assuming short duration to be 10 minutes.  
+Here I am grouping the dataset by customer ID and again grouping it by 10 minute duration. I am checking for similar transaction in the group.
+
+```{r}
+df_multi <- 
+df %>% 
+  filter(transactionType == "PURCHASE") %>%
+  group_by(customerId) %>% 
+  mutate(date_index = floor_date(transactionDateTime,unit = "10minutes")) %>% 
+  group_by(date_index) %>% 
+  filter(duplicated(transactionAmount) | duplicated(transactionAmount,fromLast = T),
+         duplicated(merchantName) | duplicated(merchantName,fromLast = T)) %>% 
+  ungroup()
+  
+df_multi %>% 
+  arrange(customerId,transactionDateTime) %>% 
+  select(accountNumber,transactionDateTime,transactionAmount, merchantName) %>% 
+  head(15) %>% 
+  knitr::kable()
+```
+
+Total number of transactions and total dollar amount for the multi-swipe transactions
+
+```{r}
+# Considering First transaction to be normal
+
+df_multi_normal <- 
+  df_multi %>% 
+  group_by(customerId,date_index) %>% 
+  distinct(transactionAmount,merchantName,.keep_all = T) %>% 
+  ungroup()
+
+df_multi %>% 
+  anti_join(df_multi_normal) %>% 
+  summarise(totalMultiTransacAmt = sum(transactionAmount),
+            totalMultiTransacCount = n()) %>% 
+  knitr::kable()
+```
+
+Removing all Multi-swipe transaction
+
+```{r}
+df <- 
+df %>% 
+  anti_join(df_multi %>% 
+            anti_join(df_multi_normal))
+```
+
+# Modelling
+
+## Balancing the dataset
+
+Our dataset is highly unbalanced.
+```{r}
+df %>% 
+  count(isFraud) %>% 
+  ggplot(aes(n,isFraud,fill=isFraud)) +
+  geom_col()+
+  guides(fill = FALSE)+
+  labs(
+    title = "Distribution of Class Label",
+    x = "Freq"
+  )+
+  geom_text(aes(label = n),hjust=0)+
+  scale_x_continuous(labels = scales::comma ,
+                     limits = c(0,850000))+
+  theme_minimal()
+
+```
+
+We have to sample our dataset to make it balanced. Here I am undersampling 12156 transaction from both Fraud and not Fraud transactions.
+
+```{r}
+df_sample <- 
+  df %>% 
+  group_by(isFraud) %>% 
+  sample_n(12156) %>% 
+  ungroup()
+```
+
+```{r}
+df_sample %>% 
+  count(isFraud) %>% 
+  ggplot(aes(n,isFraud,fill=isFraud)) +
+  geom_col()+
+  guides(fill = FALSE)+
+  labs(
+    title = "Distribution of Class Label",
+    x = "Freq"
+  )+
+  geom_text(aes(label = n),hjust=0)+
+  scale_x_continuous(labels = scales::comma ,
+                     limits = c(0,13500))+
+  theme_minimal()
+```
+
+## Feature Engineering
+
+#### Feature Selection
+Some attributes that obviously don't have any predictive power  
+1. accountNumber  
+2. customerId  
+3. cardLast4Digits  
+
+```{r}
+df_sample <- 
+  df_sample %>% 
+  select(-accountNumber, -customerId, -cardLast4Digits)
+```
+
+##### Merchant    
+
+Too many merchant and their frequencies are low.
+```{r}
+df_sample %>% 
+  count(merchantName)
+```
+
+Count for merchant category.
+```{r}
+df_sample %>% 
+  count(merchantCategoryCode) %>% 
+  knitr::kable()
+```
+
+Lets keep top 6 merchant category and lump remaining to other.
+```{r}
+df_sample <- 
+df_sample %>% 
+  mutate(merchantCategoryCode = fct_lump(merchantCategoryCode,6))
+  
+df_sample %>% 
+  count(merchantCategoryCode,sort=T) %>% 
+  knitr::kable()
+```
+
+Online gifts, retail and rideshare are more effected by fraud  
+```{r}
+df_sample %>% 
+  ggplot(aes(merchantCategoryCode, fill=isFraud))+
+  geom_bar()+
+  coord_flip()+
+  facet_wrap(~merchantCategoryCode, scales = "free", ncol = 1)+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to Merchant Cateogory"
+  )+
+  theme_minimal()+
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+
+##### Countries  
+
+ACQ Country  
+```{r}
+df_sample %>% 
+  filter(!is.na(acqCountry)) %>% 
+  ggplot(aes(acqCountry, fill=isFraud))+
+  geom_bar()+
+  coord_flip()+
+  facet_wrap(~acqCountry, scales = "free", ncol = 1)+
+  theme_minimal()+
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to ACQ Country"
+  )+
+  theme_minimal()+
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+
+Merchant Country Code  
+```{r}
+df_sample %>% 
+  filter(!is.na(merchantCountryCode)) %>% 
+  ggplot(aes(merchantCountryCode, fill=isFraud))+
+  geom_bar()+
+  coord_flip()+
+  facet_wrap(~merchantCountryCode, scales = "free", ncol = 1)+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to Merchant Country"
+  )+
+  theme_minimal()+
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+
+```
+
+##### POS  
+
+POS Entry Mode with 09 are more fraudulent and 05 more likely to be safe.
+```{r}
+df_sample %>% 
+  filter(!is.na(posEntryMode)) %>% 
+  ggplot(aes(posEntryMode, fill=isFraud))+
+  geom_bar()+
+  coord_flip()+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to POS Entry Mode"
+  )+
+  theme_minimal()+
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+
+POS Condition Code with 99 are more likely to be fraudulent.
+```{r}
+df_sample %>% 
+  filter(!is.na(posConditionCode)) %>% 
+  ggplot(aes(posConditionCode, fill=isFraud))+
+  geom_bar()+
+  coord_flip()+
+  facet_wrap(~posConditionCode, scales = "free", ncol = 1)+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to POS Condtion Code"
+  )+
+  theme_minimal()+
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+
+If card is physically present, it is less likely to be fraud.
+```{r}
+df_sample %>% 
+  filter(!is.na(cardPresent)) %>% 
+  ggplot(aes(cardPresent, fill=isFraud))+
+  geom_bar()+
+  coord_flip()+
+  facet_wrap(~cardPresent, scales = "free", ncol = 1)+
+  labs(
+    title = "Is there Card Present during transaction?"
+  )+
+  theme_minimal()+
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+```
+
+Most of the values in expirationDateKeyInMatch is FALSE.
+```{r}
+df_sample %>% 
+  count(expirationDateKeyInMatch)
+```
+
+
+Taking everything in account, I have selected follow features:  
+1. acqCountry  
+2. creditLimit  
+3. availableMoney            
+4. transactionAmount  
+5. posEntryMode  
+6. posConditionCode         
+7. merchantCategoryCode              
+8. currentBalance           
+9. cardPresent  
+
+#### Feature Creation  
+
+Lets create some features:  
+1. Transaction Days since acc. creation i.e. transDays (Are fraudulent transaction performed by card that are just created?)  
+2. Days remaining for expiry of the card i.e. expiryDays (Are older cards more likely to be safe?)  
+3. Does CVV match? i.e matchedCvv  
+4. Days since last address change. i.e. addressChangeDays (Cards whose address are recently changed, are used for fraudulent transaction ?)  
+
+```{r}
+df_sample <- 
+df_sample %>% 
+  mutate(transDays = as.duration(accountOpenDate %--% transactionDateTime)/ddays(1),
+         expiryDays = as.duration(transactionDateTime %--% currentExpDate)/ddays(1),
+         addressChangeDays = as.duration(dateOfLastAddressChange %--% transactionDateTime)/ddays(1),
+         matchedCvv = (cardCVV == enteredCVV)) %>% 
+  select(-dateOfLastAddressChange, -transactionDateTime, -accountOpenDate, currentExpDate,
+         -cardCVV, enteredCVV)
+
+```
+
+Is there any significant difference in the distribution of Fraud and not Fraud from the feature created?
+
+```{r}
+df_sample %>% 
+  ggplot(aes(transDays,isFraud))+
+  geom_boxplot()+
+  coord_flip()+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to 'Days since acc. creation'"
+  )+
+  theme_minimal()
+```
+
+```{r}
+df_sample %>% 
+  ggplot(aes(expiryDays,isFraud))+
+  geom_boxplot()+
+  coord_flip()+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to 'Days remaning for card expiry'"
+  )+
+  theme_minimal()
+```
+
+```{r}
+df_sample %>% 
+  ggplot(aes(addressChangeDays,isFraud))+
+  geom_boxplot()+
+  coord_flip()+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to 'Days since address changed'"
+  )+
+  theme_minimal()
+```
+
+```{r}
+df_sample %>% 
+  ggplot(aes(matchedCvv, fill=isFraud))+
+  geom_bar()+
+  coord_flip()+
+  facet_wrap(~matchedCvv, scales = "free", ncol = 1)+
+  labs(
+    title = "Fraud and Not Fraud Transaction acc. to 'Does CVV matched?'"
+  )+
+  theme_minimal()
+# Too small data for non matched Cvv to make any judgment
+```
+
+Couldn't find any significant difference(visually) in the distribution of Fraud and not Fraud from the feature created. So dropping them.
+
+```{r}
+df_sample <- 
+df_sample %>% 
+  select(-transDays, -expiryDays, -addressChangeDays, -matchedCvv)
+```
+
+## Model Development
+
+### Dataset preperation
+Here I am removing any row containing NA.
+
+```{r}
+df_model <- 
+  df_sample %>% 
+  filter(transactionType == "PURCHASE") %>% 
+  na.omit() %>% 
+  select(creditLimit, availableMoney, transactionAmount, acqCountry, 
+         posEntryMode, posConditionCode, merchantCategoryCode, currentBalance, 
+         cardPresent, isFraud) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate(isFraud = factor(isFraud))
+```
+
+Our data to the model is
+```{r}
+df_model %>% 
+  glimpse()
+```
+
+Splitting the data into test and train
+```{r}
+library(tidymodels)
+set.seed(2021)
+
+df_split = initial_split(df_model)
+df_train <- training(df_split)
+df_test <- testing(df_split)
+```
+
+Also splitting training data into 10 fold cross validation for tuning our model.
+```{r}
+df_train_fold = vfold_cv(df_train)
+
+df_train_fold
+```
+
+### Preprocessor
+Lets preprocesses the input data as:  
+1. Normalize all numeric data.  
+2. Create dummy variable for factors data.  
+```{r}
+preproc <- 
+recipe(isFraud ~ ., data = df_train) %>% 
+  step_normalize(all_numeric()) %>% 
+  step_dummy(all_nominal(), -isFraud)
+
+preproc
+```
+
+### Model Definition (using Decision Tree)
+I am selecting decision tree as model for fraud detection since decision tree are highly interpretable and we can easily see what attribute drives fraud detection the most.
+
+```{r}
+tree_spec <- decision_tree(
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+tree_spec
+```
+
+Workflow = preprocessor + model specification
+```{r}
+
+tree_wf <- 
+  workflow() %>% 
+  add_recipe(preproc) %>% 
+  add_model(tree_spec)
+  
+tree_wf
+```
+
+
+### Parameter Tuning
+
+Tuning parameter : cost_complexity, tree_depth, min_n of our decision tree model in our 10 fold CV set. I am using regular grid search approach for parameter value.  
+
+Parameter values which we will be training the model on.
+```{r}
+
+tree_grid <- grid_regular(cost_complexity(), tree_depth(), min_n(), levels = 3)
+
+tree_grid
+```
+
+Training model on CV set.
+
+```{r eval=FALSE}
+doParallel::registerDoParallel()
+
+tree_rs <- 
+  tree_wf %>% 
+  tune_grid(
+  resamples = df_train_fold,
+  grid = tree_grid
+  )
+
+```
+
+```{r include=FALSE}
+#saveRDS(tree_rs, "tune_result.rds")
+tree_rs <- read_rds("tune_result.rds")
+```
+
+
+Result of Tuning.
+```{r}
+autoplot(tree_rs)+
+  labs(title = "Result for different hyper-parameter values.")
+```
+
+
+```{r}
+tree_rs %>% 
+  collect_metrics() %>% 
+  select(-.config) %>% 
+  filter(.metric == "roc_auc") %>% 
+  arrange(desc(mean)) %>% 
+  head(10)
+```
+
+
+### Fitting model.
+
+```{r}
+
+final_tree <- finalize_workflow(tree_wf, select_best(tree_rs, "roc_auc"))
+
+final_tree
+
+final_result <- last_fit(final_tree, df_split)
+```
+
+# Evaluating the Model
+
+## Confusion Matrix
+
+```{r}
+library(yardstick)
+
+final_result %>% 
+  collect_predictions() %>% 
+  yardstick::conf_mat(.pred_class, isFraud) %>% 
+  autoplot(type = "heatmap") + 
+  labs(
+    title = "Confusion Matrix"
+  )
+```
+
+## ROC curve
+
+```{r}
+final_result %>% 
+  collect_predictions() %>% 
+  roc_curve(isFraud, .pred_FALSE)%>%
+  autoplot() +
+  labs(
+    title = "ROC curve"
+  )
+```
+
+## Metrics
+```{r}
+final_result %>% 
+  collect_predictions() %>% 
+  metrics(.pred_class, isFraud)
+```
+
+
+## Variable Importance
+Transaction Amount and Merchant category are important predictor for detecting fraudulent transactions.
+
+```{r}
+library(vip)
+
+fit(final_tree, df_train)%>%
+  pull_workflow_fit() %>% 
+  vi() %>% 
+  ggplot(aes(Importance, fct_reorder(Variable,Importance))) + 
+  geom_col() +
+  labs(
+    title = "Importance of a attribute for Predicting",
+    y= ""
+  )
+```
+
+# Remarks
+
+Methods I attempted that didn't work  
+* I tried creating features(transDays, expiryDays, addressChangeDays, matchedCvv) but I couldn't find any significant difference(visually) in the distribution of Fraud and not Fraud from the feature created. So I dropped it.
+
+
+I would have tried following ideas if I had more time   
+1. What if purchase and reversal don't follow immediately? For eg, person X bought A and B. Than after a minute X canceled A.  
+2. Can 10 minute be considered 'short duration' in multi-swipe transaction. I would try and test different duration.  
+3. Instead of dropping row containing missing values, I will look into imputing it.  
+4. Balancing the dataset without under sampling. For eg, using Oversampling method such as SMOTE or look into Cost-Sensitive Learning.   
+5. Interaction between attributes. For eg, interaction between country and POS entry mode, which would take into account: Does POS entry mode of 09 from Mexico more likely to be fraudulent?  
+6. I would look into more complex algorithm for modeling such as SVM or Ensemble learning.  
+
+Some Question I had.  
+* Is it possible for current balance to be more than available? Is it due to overdraft?  
+```{r}
+df %>% 
+  mutate( availableGTcurrent = availableMoney>currentBalance) %>% 
+  count(availableGTcurrent) %>% 
+  ggplot(aes(availableGTcurrent,n))+
+  geom_col()+
+  labs(
+    title = "Available Money > Current Balance",
+    x = "",
+    y = "count"
+  )+
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
