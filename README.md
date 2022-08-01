@@ -2,7 +2,7 @@
 submission for challenge
 
 
-# Capital One Data Science Challenge
+# [Capital One Data Science Challenge](https://github.com/CapitalOneRecruiting/DS)
 
 This repository contains synthetic data for the [Capital One](https://www.capitalone.com) Data Scientist Recruiting process.  If you're aready in our recruiting process, great! Please see below.
 
